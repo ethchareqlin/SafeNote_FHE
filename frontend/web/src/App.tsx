@@ -10,13 +10,22 @@ interface SecureNote {
   id: string;
   title: string;
   content: string;
+  encryptedValue: number;
   timestamp: number;
   creator: string;
-  encryptedValue: number;
-  publicValue1: number;
-  publicValue2: number;
   isVerified?: boolean;
   decryptedValue?: number;
+  category: string;
+  publicValue1: number;
+  publicValue2: number;
+}
+
+interface OperationHistory {
+  id: string;
+  type: string;
+  noteId: string;
+  timestamp: number;
+  status: string;
 }
 
 const App: React.FC = () => {
@@ -31,15 +40,24 @@ const App: React.FC = () => {
     status: "pending", 
     message: "" 
   });
-  const [newNoteData, setNewNoteData] = useState({ title: "", content: "", priority: "" });
+  const [newNoteData, setNewNoteData] = useState({ 
+    title: "", 
+    content: "", 
+    category: "personal",
+    encryptedValue: 0 
+  });
   const [selectedNote, setSelectedNote] = useState<SecureNote | null>(null);
   const [searchTerm, setSearchTerm] = useState("");
-  const [stats, setStats] = useState({ total: 0, verified: 0, encrypted: 0 });
-  const [fhevmInitializing, setFhevmInitializing] = useState(false);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [operationHistory, setOperationHistory] = useState<OperationHistory[]>([]);
+  const [showFAQ, setShowFAQ] = useState(false);
+  const notesPerPage = 5;
 
   const { status, initialize, isInitialized } = useFhevm();
   const { encrypt, isEncrypting } = useEncrypt();
   const { verifyDecryption, isDecrypting: fheIsDecrypting } = useDecrypt();
+  const [fhevmInitializing, setFhevmInitializing] = useState(false);
+  const [contractAddress, setContractAddress] = useState("");
 
   useEffect(() => {
     const initFhevmAfterConnection = async () => {
@@ -49,7 +67,7 @@ const App: React.FC = () => {
         setFhevmInitializing(true);
         await initialize();
       } catch (error) {
-        console.error('FHEVM initialization failed:', error);
+        console.error('Failed to initialize FHEVM:', error);
         setTransactionStatus({ 
           visible: true, 
           status: "error", 
@@ -65,7 +83,7 @@ const App: React.FC = () => {
   }, [isConnected, isInitialized, initialize, fhevmInitializing]);
 
   useEffect(() => {
-    const loadData = async () => {
+    const loadDataAndContract = async () => {
       if (!isConnected) {
         setLoading(false);
         return;
@@ -73,6 +91,8 @@ const App: React.FC = () => {
       
       try {
         await loadNotes();
+        const contract = await getContractReadOnly();
+        if (contract) setContractAddress(await contract.getAddress());
       } catch (error) {
         console.error('Failed to load data:', error);
       } finally {
@@ -80,8 +100,19 @@ const App: React.FC = () => {
       }
     };
 
-    loadData();
+    loadDataAndContract();
   }, [isConnected]);
+
+  const addOperationToHistory = (type: string, noteId: string, status: string) => {
+    const newOp: OperationHistory = {
+      id: Date.now().toString(),
+      type,
+      noteId,
+      timestamp: Date.now(),
+      status
+    };
+    setOperationHistory(prev => [newOp, ...prev.slice(0, 9)]);
+  };
 
   const loadNotes = async () => {
     if (!isConnected) return;
@@ -101,13 +132,14 @@ const App: React.FC = () => {
             id: businessId,
             title: businessData.name,
             content: businessData.description,
+            encryptedValue: 0,
             timestamp: Number(businessData.timestamp),
             creator: businessData.creator,
-            encryptedValue: 0,
-            publicValue1: Number(businessData.publicValue1) || 0,
-            publicValue2: Number(businessData.publicValue2) || 0,
             isVerified: businessData.isVerified,
-            decryptedValue: Number(businessData.decryptedValue) || 0
+            decryptedValue: Number(businessData.decryptedValue) || 0,
+            category: "encrypted",
+            publicValue1: Number(businessData.publicValue1) || 0,
+            publicValue2: Number(businessData.publicValue2) || 0
           });
         } catch (e) {
           console.error('Error loading note data:', e);
@@ -115,21 +147,14 @@ const App: React.FC = () => {
       }
       
       setNotes(notesList);
-      updateStats(notesList);
+      addOperationToHistory("load", "all", "success");
     } catch (e) {
       setTransactionStatus({ visible: true, status: "error", message: "Failed to load notes" });
       setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
+      addOperationToHistory("load", "all", "failed");
     } finally { 
       setIsRefreshing(false); 
     }
-  };
-
-  const updateStats = (notesList: SecureNote[]) => {
-    setStats({
-      total: notesList.length,
-      verified: notesList.filter(note => note.isVerified).length,
-      encrypted: notesList.length
-    });
   };
 
   const createNote = async () => {
@@ -140,50 +165,49 @@ const App: React.FC = () => {
     }
     
     setCreatingNote(true);
-    setTransactionStatus({ visible: true, status: "pending", message: "Creating secure note with FHE..." });
+    setTransactionStatus({ visible: true, status: "pending", message: "Creating encrypted note with FHE..." });
     
     try {
       const contract = await getContractWithSigner();
-      if (!contract) throw new Error("Failed to get contract");
+      if (!contract) throw new Error("Failed to get contract with signer");
       
-      const priorityValue = parseInt(newNoteData.priority) || 1;
+      const encryptedValue = parseInt(newNoteData.content) || 0;
       const businessId = `note-${Date.now()}`;
       
-      const encryptedResult = await encrypt(await contract.getAddress(), address, priorityValue);
+      const encryptedResult = await encrypt(contractAddress, address, encryptedValue);
       
       const tx = await contract.createBusinessData(
         businessId,
         newNoteData.title,
         encryptedResult.encryptedData,
         encryptedResult.proof,
-        priorityValue,
+        newNoteData.category === "personal" ? 1 : 0,
         0,
         newNoteData.content
       );
       
-      setTransactionStatus({ visible: true, status: "pending", message: "Waiting for confirmation..." });
+      setTransactionStatus({ visible: true, status: "pending", message: "Waiting for transaction confirmation..." });
       await tx.wait();
       
-      setTransactionStatus({ visible: true, status: "success", message: "Note created successfully!" });
-      setTimeout(() => {
-        setTransactionStatus({ visible: false, status: "pending", message: "" });
-      }, 2000);
+      setTransactionStatus({ visible: true, status: "success", message: "Note created and encrypted successfully!" });
+      addOperationToHistory("create", businessId, "success");
       
       await loadNotes();
       setShowCreateModal(false);
-      setNewNoteData({ title: "", content: "", priority: "" });
+      setNewNoteData({ title: "", content: "", category: "personal", encryptedValue: 0 });
     } catch (e: any) {
       const errorMessage = e.message?.includes("user rejected transaction") 
-        ? "Transaction rejected" 
-        : "Creation failed: " + (e.message || "Unknown error");
+        ? "Transaction rejected by user" 
+        : "Submission failed: " + (e.message || "Unknown error");
       setTransactionStatus({ visible: true, status: "error", message: errorMessage });
+      addOperationToHistory("create", "new", "failed");
       setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
     } finally { 
       setCreatingNote(false); 
     }
   };
 
-  const decryptNote = async (businessId: string): Promise<number | null> => {
+  const decryptNote = async (noteId: string): Promise<number | null> => {
     if (!isConnected || !address) { 
       setTransactionStatus({ visible: true, status: "error", message: "Please connect wallet first" });
       setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
@@ -194,63 +218,50 @@ const App: React.FC = () => {
       const contractRead = await getContractReadOnly();
       if (!contractRead) return null;
       
-      const businessData = await contractRead.getBusinessData(businessId);
+      const businessData = await contractRead.getBusinessData(noteId);
       if (businessData.isVerified) {
-        setTransactionStatus({ 
-          visible: true, 
-          status: "success", 
-          message: "Data already verified" 
-        });
-        setTimeout(() => {
-          setTransactionStatus({ visible: false, status: "pending", message: "" });
-        }, 2000);
-        return Number(businessData.decryptedValue) || 0;
+        const storedValue = Number(businessData.decryptedValue) || 0;
+        setTransactionStatus({ visible: true, status: "success", message: "Data already verified on-chain" });
+        addOperationToHistory("decrypt", noteId, "verified");
+        setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 2000);
+        return storedValue;
       }
       
       const contractWrite = await getContractWithSigner();
       if (!contractWrite) return null;
       
-      const encryptedValueHandle = await contractRead.getEncryptedValue(businessId);
+      const encryptedValueHandle = await contractRead.getEncryptedValue(noteId);
       
       const result = await verifyDecryption(
         [encryptedValueHandle],
-        await contractWrite.getAddress(),
+        contractAddress,
         (abiEncodedClearValues: string, decryptionProof: string) => 
-          contractWrite.verifyDecryption(businessId, abiEncodedClearValues, decryptionProof)
+          contractWrite.verifyDecryption(noteId, abiEncodedClearValues, decryptionProof)
       );
       
-      setTransactionStatus({ visible: true, status: "pending", message: "Verifying decryption..." });
+      setTransactionStatus({ visible: true, status: "pending", message: "Verifying decryption on-chain..." });
       
       const clearValue = result.decryptionResult.clearValues[encryptedValueHandle];
       
       await loadNotes();
+      addOperationToHistory("decrypt", noteId, "success");
       
-      setTransactionStatus({ visible: true, status: "success", message: "Data verified successfully!" });
-      setTimeout(() => {
-        setTransactionStatus({ visible: false, status: "pending", message: "" });
-      }, 2000);
+      setTransactionStatus({ visible: true, status: "success", message: "Note decrypted successfully!" });
+      setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 2000);
       
       return Number(clearValue);
       
     } catch (e: any) { 
       if (e.message?.includes("Data already verified")) {
-        setTransactionStatus({ 
-          visible: true, 
-          status: "success", 
-          message: "Data is already verified" 
-        });
-        setTimeout(() => {
-          setTransactionStatus({ visible: false, status: "pending", message: "" });
-        }, 2000);
+        setTransactionStatus({ visible: true, status: "success", message: "Data is already verified on-chain" });
+        setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 2000);
         await loadNotes();
+        addOperationToHistory("decrypt", noteId, "already_verified");
         return null;
       }
       
-      setTransactionStatus({ 
-        visible: true, 
-        status: "error", 
-        message: "Decryption failed: " + (e.message || "Unknown error") 
-      });
+      setTransactionStatus({ visible: true, status: "error", message: "Decryption failed" });
+      addOperationToHistory("decrypt", noteId, "failed");
       setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
       return null; 
     }
@@ -261,9 +272,10 @@ const App: React.FC = () => {
       const contract = await getContractReadOnly();
       if (!contract) return;
       
-      const available = await contract.isAvailable();
-      if (available) {
+      const isAvailable = await contract.isAvailable();
+      if (isAvailable) {
         setTransactionStatus({ visible: true, status: "success", message: "FHE system is available!" });
+        addOperationToHistory("check", "system", "available");
         setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 2000);
       }
     } catch (e) {
@@ -272,10 +284,18 @@ const App: React.FC = () => {
     }
   };
 
-  const filteredNotes = notes.filter(note =>
+  const filteredNotes = notes.filter(note => 
     note.title.toLowerCase().includes(searchTerm.toLowerCase()) ||
-    note.content.toLowerCase().includes(searchTerm.toLowerCase())
+    note.content.toLowerCase().includes(searchTerm.toLowerCase()) ||
+    note.category.toLowerCase().includes(searchTerm.toLowerCase())
   );
+
+  const paginatedNotes = filteredNotes.slice(
+    (currentPage - 1) * notesPerPage,
+    currentPage * notesPerPage
+  );
+
+  const totalPages = Math.ceil(filteredNotes.length / notesPerPage);
 
   if (!isConnected) {
     return (
@@ -283,32 +303,16 @@ const App: React.FC = () => {
         <header className="app-header">
           <div className="logo">
             <h1>SafeNote FHE 🔐</h1>
-            <p>FHE-based Secure Notes</p>
+            <p>Encrypted Secure Notes</p>
           </div>
-          <div className="header-actions">
-            <ConnectButton accountStatus="address" chainStatus="icon" showBalance={false}/>
-          </div>
+          <ConnectButton />
         </header>
         
         <div className="connection-prompt">
           <div className="connection-content">
             <div className="connection-icon">🔒</div>
-            <h2>Connect Your Wallet to Access Secure Notes</h2>
-            <p>Your notes are encrypted with FHE technology for maximum privacy protection.</p>
-            <div className="connection-steps">
-              <div className="step">
-                <span>1</span>
-                <p>Connect your wallet to initialize FHE system</p>
-              </div>
-              <div className="step">
-                <span>2</span>
-                <p>Create encrypted notes with homomorphic properties</p>
-              </div>
-              <div className="step">
-                <span>3</span>
-                <p>Search and verify your data securely</p>
-              </div>
-            </div>
+            <h2>Connect Your Wallet to Continue</h2>
+            <p>Please connect your wallet to access encrypted secure notes with FHE technology.</p>
           </div>
         </div>
       </div>
@@ -320,7 +324,6 @@ const App: React.FC = () => {
       <div className="loading-screen">
         <div className="fhe-spinner"></div>
         <p>Initializing FHE Encryption System...</p>
-        <p className="loading-note">Securing your notes with homomorphic encryption</p>
       </div>
     );
   }
@@ -328,297 +331,253 @@ const App: React.FC = () => {
   if (loading) return (
     <div className="loading-screen">
       <div className="fhe-spinner"></div>
-      <p>Loading secure notes...</p>
+      <p>Loading encrypted notes...</p>
     </div>
   );
 
   return (
     <div className="app-container">
       <header className="app-header">
-        <div className="logo">
+        <div className="logo-section">
           <h1>SafeNote FHE 🔐</h1>
-          <p>Fully Homomorphic Encrypted Notes</p>
+          <p>Fully Homomorphic Encrypted Secure Notes</p>
         </div>
         
         <div className="header-actions">
-          <button onClick={checkAvailability} className="status-btn">
-            Check FHE Status
+          <button className="faq-btn" onClick={() => setShowFAQ(!showFAQ)}>
+            FAQ
           </button>
-          <button onClick={() => setShowCreateModal(true)} className="create-btn">
+          <button className="availability-btn" onClick={checkAvailability}>
+            Check FHE
+          </button>
+          <button className="create-btn" onClick={() => setShowCreateModal(true)}>
             + New Note
           </button>
-          <ConnectButton accountStatus="address" chainStatus="icon" showBalance={false}/>
+          <ConnectButton />
         </div>
       </header>
-      
+
+      {showFAQ && (
+        <div className="faq-panel">
+          <h3>FHE Secure Notes FAQ</h3>
+          <div className="faq-item">
+            <strong>What is FHE?</strong>
+            <p>Fully Homomorphic Encryption allows computations on encrypted data without decryption.</p>
+          </div>
+          <div className="faq-item">
+            <strong>How are notes encrypted?</strong>
+            <p>Note content is encrypted using Zama FHE technology before being stored on-chain.</p>
+          </div>
+          <div className="faq-item">
+            <strong>Can I search encrypted notes?</strong>
+            <p>Yes! FHE enables searching through encrypted content without revealing the data.</p>
+          </div>
+          <button className="close-faq" onClick={() => setShowFAQ(false)}>Close</button>
+        </div>
+      )}
+
       <div className="main-content">
-        <div className="stats-panel">
-          <div className="stat-item">
-            <div className="stat-value">{stats.total}</div>
-            <div className="stat-label">Total Notes</div>
+        <div className="sidebar">
+          <div className="search-section">
+            <input
+              type="text"
+              placeholder="Search encrypted notes..."
+              value={searchTerm}
+              onChange={(e) => setSearchTerm(e.target.value)}
+              className="search-input"
+            />
           </div>
-          <div className="stat-item">
-            <div className="stat-value">{stats.verified}</div>
-            <div className="stat-label">Verified</div>
+
+          <div className="stats-panel">
+            <h3>Encryption Stats</h3>
+            <div className="stat-item">
+              <span>Total Notes:</span>
+              <span>{notes.length}</span>
+            </div>
+            <div className="stat-item">
+              <span>Verified:</span>
+              <span>{notes.filter(n => n.isVerified).length}</span>
+            </div>
+            <div className="stat-item">
+              <span>Encrypted:</span>
+              <span>{notes.length}</span>
+            </div>
           </div>
-          <div className="stat-item">
-            <div className="stat-value">{stats.encrypted}</div>
-            <div className="stat-label">Encrypted</div>
+
+          <div className="history-panel">
+            <h3>Recent Operations</h3>
+            {operationHistory.slice(0, 5).map(op => (
+              <div key={op.id} className="history-item">
+                <span className="op-type">{op.type}</span>
+                <span className="op-status">{op.status}</span>
+                <span className="op-time">{new Date(op.timestamp).toLocaleTimeString()}</span>
+              </div>
+            ))}
           </div>
         </div>
-        
-        <div className="search-section">
-          <input
-            type="text"
-            placeholder="Search notes..."
-            value={searchTerm}
-            onChange={(e) => setSearchTerm(e.target.value)}
-            className="search-input"
-          />
-          <button onClick={loadNotes} className="refresh-btn" disabled={isRefreshing}>
-            {isRefreshing ? "Refreshing..." : "Refresh"}
-          </button>
-        </div>
-        
-        <div className="notes-grid">
-          {filteredNotes.length === 0 ? (
-            <div className="no-notes">
-              <p>No secure notes found</p>
-              <button onClick={() => setShowCreateModal(true)} className="create-btn">
-                Create First Note
+
+        <div className="content-area">
+          <div className="notes-header">
+            <h2>Encrypted Notes</h2>
+            <button onClick={loadNotes} disabled={isRefreshing} className="refresh-btn">
+              {isRefreshing ? "Refreshing..." : "Refresh"}
+            </button>
+          </div>
+
+          <div className="notes-grid">
+            {paginatedNotes.length === 0 ? (
+              <div className="empty-state">
+                <p>No encrypted notes found</p>
+                <button onClick={() => setShowCreateModal(true)} className="create-btn">
+                  Create First Note
+                </button>
+              </div>
+            ) : (
+              paginatedNotes.map((note) => (
+                <div 
+                  key={note.id} 
+                  className={`note-card ${selectedNote?.id === note.id ? "selected" : ""} ${note.isVerified ? "verified" : ""}`}
+                  onClick={() => setSelectedNote(note)}
+                >
+                  <div className="note-header">
+                    <h3>{note.title}</h3>
+                    <span className={`status-badge ${note.isVerified ? "verified" : "encrypted"}`}>
+                      {note.isVerified ? "✅ Verified" : "🔒 Encrypted"}
+                    </span>
+                  </div>
+                  <p className="note-preview">{note.content.substring(0, 100)}...</p>
+                  <div className="note-meta">
+                    <span>{new Date(note.timestamp * 1000).toLocaleDateString()}</span>
+                    <span>{note.category}</span>
+                  </div>
+                  {note.isVerified && note.decryptedValue && (
+                    <div className="decrypted-value">
+                      Decrypted: {note.decryptedValue}
+                    </div>
+                  )}
+                </div>
+              ))
+            )}
+          </div>
+
+          {totalPages > 1 && (
+            <div className="pagination">
+              <button 
+                disabled={currentPage === 1} 
+                onClick={() => setCurrentPage(currentPage - 1)}
+              >
+                Previous
+              </button>
+              <span>Page {currentPage} of {totalPages}</span>
+              <button 
+                disabled={currentPage === totalPages} 
+                onClick={() => setCurrentPage(currentPage + 1)}
+              >
+                Next
               </button>
             </div>
-          ) : (
-            filteredNotes.map((note) => (
-              <div 
-                key={note.id}
-                className={`note-card ${selectedNote?.id === note.id ? "selected" : ""}`}
-                onClick={() => setSelectedNote(note)}
-              >
-                <div className="note-header">
-                  <h3>{note.title}</h3>
-                  <span className={`status-badge ${note.isVerified ? "verified" : "encrypted"}`}>
-                    {note.isVerified ? "✅ Verified" : "🔒 Encrypted"}
-                  </span>
-                </div>
-                <div className="note-content">
-                  {note.content.substring(0, 100)}...
-                </div>
-                <div className="note-footer">
-                  <span>Priority: {note.publicValue1}</span>
-                  <span>{new Date(note.timestamp * 1000).toLocaleDateString()}</span>
-                </div>
-              </div>
-            ))
           )}
         </div>
       </div>
-      
+
       {showCreateModal && (
-        <CreateNoteModal 
-          onSubmit={createNote} 
-          onClose={() => setShowCreateModal(false)} 
-          creating={creatingNote} 
-          noteData={newNoteData} 
-          setNoteData={setNewNoteData}
-          isEncrypting={isEncrypting}
-        />
-      )}
-      
-      {selectedNote && (
-        <NoteDetailModal 
-          note={selectedNote} 
-          onClose={() => setSelectedNote(null)} 
-          isDecrypting={fheIsDecrypting} 
-          decryptData={() => decryptNote(selectedNote.id)}
-        />
-      )}
-      
-      {transactionStatus.visible && (
-        <div className="transaction-modal">
-          <div className="transaction-content">
-            <div className={`transaction-icon ${transactionStatus.status}`}>
-              {transactionStatus.status === "pending" && <div className="fhe-spinner"></div>}
-              {transactionStatus.status === "success" && "✓"}
-              {transactionStatus.status === "error" && "✗"}
+        <div className="modal-overlay">
+          <div className="create-modal">
+            <div className="modal-header">
+              <h2>Create Encrypted Note</h2>
+              <button onClick={() => setShowCreateModal(false)}>×</button>
             </div>
-            <div className="transaction-message">{transactionStatus.message}</div>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-};
-
-const CreateNoteModal: React.FC<{
-  onSubmit: () => void; 
-  onClose: () => void; 
-  creating: boolean;
-  noteData: any;
-  setNoteData: (data: any) => void;
-  isEncrypting: boolean;
-}> = ({ onSubmit, onClose, creating, noteData, setNoteData, isEncrypting }) => {
-  const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => {
-    const { name, value } = e.target;
-    if (name === 'priority') {
-      const intValue = value.replace(/[^\d]/g, '');
-      setNoteData({ ...noteData, [name]: intValue });
-    } else {
-      setNoteData({ ...noteData, [name]: value });
-    }
-  };
-
-  return (
-    <div className="modal-overlay">
-      <div className="create-note-modal">
-        <div className="modal-header">
-          <h2>New Secure Note</h2>
-          <button onClick={onClose} className="close-modal">&times;</button>
-        </div>
-        
-        <div className="modal-body">
-          <div className="fhe-notice">
-            <strong>FHE 🔐 Encryption Active</strong>
-            <p>Note priority will be encrypted with homomorphic encryption</p>
-          </div>
-          
-          <div className="form-group">
-            <label>Title *</label>
-            <input 
-              type="text" 
-              name="title" 
-              value={noteData.title} 
-              onChange={handleChange} 
-              placeholder="Enter note title..." 
-            />
-          </div>
-          
-          <div className="form-group">
-            <label>Content *</label>
-            <textarea 
-              name="content" 
-              value={noteData.content} 
-              onChange={handleChange} 
-              placeholder="Enter your note content..." 
-              rows={4}
-            />
-          </div>
-          
-          <div className="form-group">
-            <label>Priority Level (1-10) *</label>
-            <input 
-              type="number" 
-              min="1" 
-              max="10" 
-              name="priority" 
-              value={noteData.priority} 
-              onChange={handleChange} 
-              placeholder="Enter priority..." 
-            />
-            <div className="data-type-label">FHE Encrypted Integer</div>
-          </div>
-        </div>
-        
-        <div className="modal-footer">
-          <button onClick={onClose} className="cancel-btn">Cancel</button>
-          <button 
-            onClick={onSubmit} 
-            disabled={creating || isEncrypting || !noteData.title || !noteData.content || !noteData.priority} 
-            className="submit-btn"
-          >
-            {creating || isEncrypting ? "Encrypting and Creating..." : "Create Secure Note"}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-};
-
-const NoteDetailModal: React.FC<{
-  note: SecureNote;
-  onClose: () => void;
-  isDecrypting: boolean;
-  decryptData: () => Promise<number | null>;
-}> = ({ note, onClose, isDecrypting, decryptData }) => {
-  const [decryptedValue, setDecryptedValue] = useState<number | null>(null);
-
-  const handleDecrypt = async () => {
-    if (note.isVerified) return;
-    
-    const value = await decryptData();
-    if (value !== null) {
-      setDecryptedValue(value);
-    }
-  };
-
-  return (
-    <div className="modal-overlay">
-      <div className="note-detail-modal">
-        <div className="modal-header">
-          <h2>Note Details</h2>
-          <button onClick={onClose} className="close-modal">&times;</button>
-        </div>
-        
-        <div className="modal-body">
-          <div className="note-info">
-            <div className="info-item">
-              <span>Title:</span>
-              <strong>{note.title}</strong>
-            </div>
-            <div className="info-item">
-              <span>Created:</span>
-              <strong>{new Date(note.timestamp * 1000).toLocaleString()}</strong>
-            </div>
-            <div className="info-item">
-              <span>Creator:</span>
-              <strong>{note.creator.substring(0, 8)}...{note.creator.substring(36)}</strong>
-            </div>
-          </div>
-          
-          <div className="content-section">
-            <h3>Content</h3>
-            <div className="note-content-full">
-              {note.content}
-            </div>
-          </div>
-          
-          <div className="encryption-section">
-            <h3>FHE Encryption Status</h3>
-            <div className="encryption-info">
-              <div className="encryption-status">
-                <span>Priority Level:</span>
-                <strong>
-                  {note.isVerified ? 
-                    `${note.decryptedValue} (Verified)` : 
-                    decryptedValue !== null ? 
-                    `${decryptedValue} (Decrypted)` : 
-                    "🔒 Encrypted"
-                  }
-                </strong>
+            <div className="modal-body">
+              <div className="form-group">
+                <label>Title</label>
+                <input
+                  type="text"
+                  value={newNoteData.title}
+                  onChange={(e) => setNewNoteData({...newNoteData, title: e.target.value})}
+                  placeholder="Note title..."
+                />
               </div>
-              
+              <div className="form-group">
+                <label>Content (Integer only for FHE encryption)</label>
+                <input
+                  type="number"
+                  value={newNoteData.content}
+                  onChange={(e) => setNewNoteData({...newNoteData, content: e.target.value})}
+                  placeholder="Enter integer content..."
+                />
+              </div>
+              <div className="form-group">
+                <label>Category</label>
+                <select 
+                  value={newNoteData.category}
+                  onChange={(e) => setNewNoteData({...newNoteData, category: e.target.value})}
+                >
+                  <option value="personal">Personal</option>
+                  <option value="work">Work</option>
+                  <option value="financial">Financial</option>
+                </select>
+              </div>
+            </div>
+            <div className="modal-footer">
+              <button onClick={() => setShowCreateModal(false)}>Cancel</button>
               <button 
-                className={`decrypt-btn ${(note.isVerified || decryptedValue !== null) ? 'decrypted' : ''}`}
-                onClick={handleDecrypt} 
-                disabled={isDecrypting || note.isVerified}
+                onClick={createNote}
+                disabled={creatingNote || !newNoteData.title || !newNoteData.content}
               >
-                {isDecrypting ? "Decrypting..." : 
-                 note.isVerified ? "✅ Verified" : 
-                 decryptedValue !== null ? "🔓 Decrypted" : 
-                 "🔓 Verify Decryption"}
+                {creatingNote ? "Encrypting..." : "Create Encrypted Note"}
               </button>
             </div>
-            
-            <div className="fhe-explanation">
-              <p>This note's priority is encrypted using FHE. You can verify the decryption without revealing the plaintext to the network.</p>
+          </div>
+        </div>
+      )}
+
+      {selectedNote && (
+        <div className="modal-overlay">
+          <div className="note-detail-modal">
+            <div className="modal-header">
+              <h2>{selectedNote.title}</h2>
+              <button onClick={() => setSelectedNote(null)}>×</button>
+            </div>
+            <div className="modal-body">
+              <div className="note-info">
+                <p><strong>Content:</strong> {selectedNote.content}</p>
+                <p><strong>Created:</strong> {new Date(selectedNote.timestamp * 1000).toLocaleString()}</p>
+                <p><strong>Category:</strong> {selectedNote.category}</p>
+                <p><strong>Status:</strong> {selectedNote.isVerified ? "Verified" : "Encrypted"}</p>
+              </div>
+              
+              {selectedNote.isVerified ? (
+                <div className="verified-section">
+                  <h3>✅ On-chain Verified</h3>
+                  <p>Decrypted value: {selectedNote.decryptedValue}</p>
+                </div>
+              ) : (
+                <div className="decrypt-section">
+                  <button 
+                    onClick={() => decryptNote(selectedNote.id)}
+                    disabled={fheIsDecrypting}
+                    className="decrypt-btn"
+                  >
+                    {fheIsDecrypting ? "Decrypting..." : "🔓 Decrypt Note"}
+                  </button>
+                  <p>This will verify the decryption on-chain using FHE technology</p>
+                </div>
+              )}
             </div>
           </div>
         </div>
-        
-        <div className="modal-footer">
-          <button onClick={onClose} className="close-btn">Close</button>
+      )}
+
+      {transactionStatus.visible && (
+        <div className="transaction-toast">
+          <div className={`toast-content ${transactionStatus.status}`}>
+            {transactionStatus.status === "pending" && <div className="spinner"></div>}
+            {transactionStatus.status === "success" && "✓"}
+            {transactionStatus.status === "error" && "✗"}
+            <span>{transactionStatus.message}</span>
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 };
